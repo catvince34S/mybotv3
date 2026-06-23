@@ -1,18 +1,19 @@
+"use strict";
+
+const MAX_LOGS = 500;
 const logs = [];
 
 function addLog(message) {
-  const time = new Date().toLocaleTimeString();
-  const formatted = `[${time}] ${message}`;
-
-  console.log(formatted); // still goes to Render logs
-
-  logs.push(formatted);
-
-  if (logs.length > 300) logs.shift();
+  const now = new Date();
+  const ts = now.toISOString().replace("T", " ").substring(0, 19);
+  const entry = `[${ts}] ${message}`;
+  console.log(entry);
+  logs.push(entry);
+  if (logs.length > MAX_LOGS) logs.shift();
 }
 
 function getLogs() {
-  return logs;
+  return [...logs];
 }
 
 module.exports = { addLog, getLogs };
