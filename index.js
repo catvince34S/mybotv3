@@ -1761,38 +1761,97 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   });
 
-  // ---------- SELF-DEFENSE ----------
-  // Always-on: attack any mob within melee range of the bot itself,
-  // regardless of combat module setting or protect mode.
+  // ---------- SELF-DEFENSE (PRO COMBAT) ----------
+  // Aims at enemy head, jumps for crits (1.5x dmg), sprints for knockback,
+  // w-taps after each hit. Runs every 50ms to match game tick.
   let lastSelfDefenseAttack = 0;
-  bot.on("physicsTick", () => {
+  let combatTarget = null;
+  let critPending = false;
+
+  addInterval(() => {
     if (!bot || !botState.connected) return;
     const now = Date.now();
-    if (now - lastSelfDefenseAttack < 620) return;
 
-    try {
-      const threats = Object.values(bot.entities).filter((e) => {
-        if (!e.position || e.type !== "mob") return false;
-        return bot.entity.position.distanceTo(e.position) < 3.5;
-      });
+    // Scan for mobs within 5 blocks
+    const threats = Object.values(bot.entities).filter((e) => {
+      if (!e || !e.position || e.type !== "mob") return false;
+      return bot.entity.position.distanceTo(e.position) < 5;
+    });
 
-      if (threats.length === 0) return;
+    if (threats.length === 0) {
+      if (combatTarget) {
+        combatTarget = null;
+        critPending = false;
+        try { bot.setControlState("sprint", false); } catch (e) {}
+      }
+      return;
+    }
 
-      // Pick closest threat
-      const closest = threats.reduce((best, e) =>
+    // Keep locked target if still valid, otherwise pick closest
+    const stillValid =
+      combatTarget &&
+      bot.entities[combatTarget.id] &&
+      bot.entity.position.distanceTo(combatTarget.position) < 5;
+
+    if (!stillValid) {
+      combatTarget = threats.reduce((best, e) =>
         bot.entity.position.distanceTo(e.position) <
         bot.entity.position.distanceTo(best.position)
-          ? e
-          : best
+          ? e : best
       );
-
-      bot.attack(closest);
-      lastSelfDefenseAttack = now;
-      addLog(`[SelfDefense] Attacked ${closest.name || closest.type}`);
-    } catch (e) {
-      // physicsTick fires every tick — swallow errors silently
+      critPending = false;
     }
-  });
+
+    const dist = bot.entity.position.distanceTo(combatTarget.position);
+
+    // Aim at enemy head for accurate hits (instant look, no smoothing)
+    try {
+      const eyeY   = bot.entity.position.y + (bot.entity.height ?? 1.62);
+      const headY  = combatTarget.position.y + (combatTarget.height ?? 1.62) * 0.85;
+      const dx = combatTarget.position.x - bot.entity.position.x;
+      const dy = headY - eyeY;
+      const dz = combatTarget.position.z - bot.entity.position.z;
+      const yaw   = Math.atan2(-dx, dz);
+      const pitch = Math.atan2(-dy, Math.sqrt(dx * dx + dz * dz));
+      bot.look(yaw, pitch, true); // force=true → instant
+    } catch (e) {}
+
+    // Sprint while target is in range
+    try { bot.setControlState("sprint", dist < 4.5); } catch (e) {}
+
+    // Gate: full attack cooldown (620ms) + melee range
+    if (now - lastSelfDefenseAttack < 620) return;
+    if (dist > 3.2) return;
+
+    const onGround = bot.entity.onGround;
+    const isFalling = !onGround && (bot.entity.velocity?.y ?? 0) < -0.08;
+
+    if (isFalling) {
+      // Falling phase = guaranteed critical hit
+      try {
+        bot.attack(combatTarget);
+        lastSelfDefenseAttack = now;
+        critPending = false;
+        addLog(`[Combat] ⚡ CRIT on ${combatTarget.name || combatTarget.type} (${dist.toFixed(1)}m)`);
+        // W-tap: briefly stop sprint so next sprint-attack resets knockback dir
+        bot.setControlState("sprint", false);
+        setTimeout(() => {
+          try { bot.setControlState("sprint", true); } catch (e) {}
+        }, 80);
+      } catch (e) {}
+    } else if (onGround && !critPending) {
+      // On ground + cooldown ready → jump to enter falling phase for crit
+      critPending = true;
+      try {
+        bot.setControlState("jump", true);
+        setTimeout(() => {
+          try { bot.setControlState("jump", false); } catch (e) {}
+          setTimeout(() => { critPending = false; }, 600);
+        }, 80);
+      } catch (e) {}
+    }
+    // Rising phase: do nothing — wait until we start falling
+  }, 50);
 
   addLog("[Modules] All modules initialized!");
 }
