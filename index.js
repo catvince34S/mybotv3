@@ -1761,6 +1761,39 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   });
 
+  // ---------- SELF-DEFENSE ----------
+  // Always-on: attack any mob within melee range of the bot itself,
+  // regardless of combat module setting or protect mode.
+  let lastSelfDefenseAttack = 0;
+  bot.on("physicsTick", () => {
+    if (!bot || !botState.connected) return;
+    const now = Date.now();
+    if (now - lastSelfDefenseAttack < 620) return;
+
+    try {
+      const threats = Object.values(bot.entities).filter((e) => {
+        if (!e.position || e.type !== "mob") return false;
+        return bot.entity.position.distanceTo(e.position) < 3.5;
+      });
+
+      if (threats.length === 0) return;
+
+      // Pick closest threat
+      const closest = threats.reduce((best, e) =>
+        bot.entity.position.distanceTo(e.position) <
+        bot.entity.position.distanceTo(best.position)
+          ? e
+          : best
+      );
+
+      bot.attack(closest);
+      lastSelfDefenseAttack = now;
+      addLog(`[SelfDefense] Attacked ${closest.name || closest.type}`);
+    } catch (e) {
+      // physicsTick fires every tick — swallow errors silently
+    }
+  });
+
   addLog("[Modules] All modules initialized!");
 }
 
