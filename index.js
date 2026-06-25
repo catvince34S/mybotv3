@@ -1068,7 +1068,7 @@ app.post("/command", express.json(), (req, res) => {
       return res.json({ success: true, msg: "Protection disabled." });
     }
     startProtection(arg);
-    return res.json({ success: true, msg: `Protect command sent for "${arg}". Watch bot chat for response.` });
+    return res.json({ success: true, msg: `Now protecting "${arg}".` });
   }
 
   if (!bot || typeof bot.chat !== "function") {
@@ -1215,22 +1215,38 @@ function getReconnectDelay() {
 // ============================================================
 // PROTECT MODULE FUNCTIONS
 // ============================================================
+
+// FIX: startProtection now always sets protectedPlayer as long as the player
+// exists in the server's player list. Previously it bailed early when the
+// player's entity wasn't loaded yet (e.g. they were in a different chunk),
+// so protectedPlayer was never set and protection never activated.
 function startProtection(username) {
   if (!bot || !botState.connected) {
     addLog("[Protect] Bot not connected - can't start protection");
     return;
   }
 
+  // Check the player list (not entity) — they're on the server even if not
+  // yet within render distance of the bot.
   const player = bot.players[username];
-  if (!player || !player.entity) {
-    bot.chat(`who's that?`);
-    addLog(`[Protect] Player "${username}" not found on server`);
+  if (!player) {
+    try { bot.chat(`I don't see ${username} on this server!`); } catch (e) {}
+    addLog(`[Protect] Player "${username}" is not on the server`);
     return;
   }
 
+  // Always set protectedPlayer — the interval will start following/attacking
+  // as soon as the entity loads into the bot's view.
   protectedPlayer = username;
-  bot.chat(`SIR YES SIR!`);
-  addLog(`[Protect] Now protecting ${username}`);
+  addLog(`[Protect] Now protecting "${username}"`);
+
+  if (!player.entity) {
+    // Entity not in render distance yet — that's fine, interval will pick it up
+    addLog(`[Protect] "${username}" entity not loaded yet — will activate when nearby`);
+    try { bot.chat(`I'll protect ${username} once they're nearby!`); } catch (e) {}
+  } else {
+    try { bot.chat(`SIR YES SIR!`); } catch (e) {}
+  }
 }
 
 function stopProtection() {
@@ -1444,7 +1460,6 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    // FIX: read password from env var first, fall back to settings.json
     const password =
       process.env.AUTH_PASSWORD || config.utils["auto-auth"].password;
 
@@ -1598,7 +1613,7 @@ function initializeModules(bot, mcData, defaultMove) {
             !bot ||
             !botState.connected ||
             typeof bot.setControlState !== "function" ||
-            protectedPlayer
+            protectedPlayer  // Don't random-walk while protecting
           )
             return;
           try {
@@ -1669,48 +1684,78 @@ function initializeModules(bot, mcData, defaultMove) {
   }
 
   // ---------- PROTECT MODULE ----------
+  // Runs every 500ms: follows the protected player and attacks nearby threats.
+  //
+  // FIX: The follow logic now properly handles the case where GoalFollow is
+  // unavailable by falling back to GoalNear (dynamic) instead of GoalBlock
+  // (static). It also stops pathfinding when already close enough, preventing
+  // jitter, and only updates the follow goal when needed.
+  let lastFollowGoalSet = 0;
+
   addInterval(() => {
     if (!bot || !botState.connected || !protectedPlayer) return;
 
     const player = bot.players[protectedPlayer];
-    if (!player || !player.entity) return;
+    if (!player || !player.entity) return; // Not in render distance yet
 
     const targetEntity = player.entity;
 
-    // Follow the protected player (stay within 2 blocks)
+    // ---- FOLLOW ----
     try {
       const distToPlayer = bot.entity.position.distanceTo(targetEntity.position);
-      if (distToPlayer > 3) {
-        bot.pathfinder.setMovements(defaultMove);
-        if (goals.GoalFollow) {
-          bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 2), true);
-        } else {
-          const pos = targetEntity.position;
-          bot.pathfinder.setGoal(
-            new GoalBlock(
-              Math.floor(pos.x),
-              Math.floor(pos.y),
-              Math.floor(pos.z)
-            )
-          );
+      const now = Date.now();
+
+      if (distToPlayer > 4) {
+        // Only update the pathfinding goal every 1s to avoid spamming it
+        if (now - lastFollowGoalSet > 1000) {
+          lastFollowGoalSet = now;
+          bot.pathfinder.setMovements(defaultMove);
+
+          if (goals.GoalFollow) {
+            // Dynamic goal: pathfinder continuously updates as entity moves
+            bot.pathfinder.setGoal(new goals.GoalFollow(targetEntity, 3), true);
+          } else if (goals.GoalNear) {
+            // Fallback: go to within 3 blocks of current position (updates each second)
+            bot.pathfinder.setGoal(
+              new goals.GoalNear(
+                targetEntity.position.x,
+                targetEntity.position.y,
+                targetEntity.position.z,
+                3
+              )
+            );
+          } else {
+            // Last resort: walk to exact block position
+            bot.pathfinder.setGoal(
+              new GoalBlock(
+                Math.floor(targetEntity.position.x),
+                Math.floor(targetEntity.position.y),
+                Math.floor(targetEntity.position.z)
+              )
+            );
+          }
         }
+      } else {
+        // Close enough — stop pathfinding so the bot doesn't jitter in place
+        try { bot.pathfinder.stop(); } catch (e) {}
       }
     } catch (e) {
       addLog("[Protect] Follow error: " + e.message);
     }
 
-    // Attack hostile mobs threatening the protected player
-    const now = Date.now();
-    if (now - lastProtectAttack < 620) return;
+    // ---- COMBAT ----
+    const nowMs = Date.now();
+    if (nowMs - lastProtectAttack < 620) return; // Respect attack cooldown
 
     try {
       const threats = Object.values(bot.entities).filter((e) => {
-        if (!e.position || e.type !== "mob") return false;
+        if (!e || !e.position || e.type !== "mob") return false;
         return e.position.distanceTo(targetEntity.position) < 6;
       });
 
       if (threats.length === 0) return;
 
+      // Pick the threat closest to the bot (easiest to reach)
       const closestThreat = threats.reduce((best, e) =>
         bot.entity.position.distanceTo(e.position) <
         bot.entity.position.distanceTo(best.position)
@@ -1722,9 +1767,10 @@ function initializeModules(bot, mcData, defaultMove) {
 
       if (distToThreat < 4) {
         bot.attack(closestThreat);
-        lastProtectAttack = now;
-        addLog(`[Protect] Attacking threat near ${protectedPlayer}`);
+        lastProtectAttack = nowMs;
+        addLog(`[Protect] Attacking ${closestThreat.name || closestThreat.type} near ${protectedPlayer}`);
       } else {
+        // Move toward the threat first
         bot.pathfinder.setMovements(defaultMove);
         bot.pathfinder.setGoal(
           new GoalBlock(
@@ -1761,9 +1807,7 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   });
 
-  // ---------- SELF-DEFENSE (PRO COMBAT) ----------
-  // Aims at enemy head, jumps for crits (1.5x dmg), sprints for knockback,
-  // w-taps after each hit. Runs every 50ms to match game tick.
+  // ---------- SELF-DEFENSE ----------
   let lastSelfDefenseAttack = 0;
   let combatTarget = null;
   let critPending = false;
@@ -1772,7 +1816,6 @@ function initializeModules(bot, mcData, defaultMove) {
     if (!bot || !botState.connected) return;
     const now = Date.now();
 
-    // Scan for mobs within 5 blocks
     const threats = Object.values(bot.entities).filter((e) => {
       if (!e || !e.position || e.type !== "mob") return false;
       return bot.entity.position.distanceTo(e.position) < 5;
@@ -1787,7 +1830,6 @@ function initializeModules(bot, mcData, defaultMove) {
       return;
     }
 
-    // Keep locked target if still valid, otherwise pick closest
     const stillValid =
       combatTarget &&
       bot.entities[combatTarget.id] &&
@@ -1804,7 +1846,6 @@ function initializeModules(bot, mcData, defaultMove) {
 
     const dist = bot.entity.position.distanceTo(combatTarget.position);
 
-    // Aim at enemy head for accurate hits (instant look, no smoothing)
     try {
       const eyeY   = bot.entity.position.y + (bot.entity.height ?? 1.62);
       const headY  = combatTarget.position.y + (combatTarget.height ?? 1.62) * 0.85;
@@ -1813,13 +1854,11 @@ function initializeModules(bot, mcData, defaultMove) {
       const dz = combatTarget.position.z - bot.entity.position.z;
       const yaw   = Math.atan2(-dx, dz);
       const pitch = Math.atan2(-dy, Math.sqrt(dx * dx + dz * dz));
-      bot.look(yaw, pitch, true); // force=true → instant
+      bot.look(yaw, pitch, true);
     } catch (e) {}
 
-    // Sprint while target is in range
     try { bot.setControlState("sprint", dist < 4.5); } catch (e) {}
 
-    // Gate: full attack cooldown (620ms) + melee range
     if (now - lastSelfDefenseAttack < 620) return;
     if (dist > 3.2) return;
 
@@ -1827,20 +1866,17 @@ function initializeModules(bot, mcData, defaultMove) {
     const isFalling = !onGround && (bot.entity.velocity?.y ?? 0) < -0.08;
 
     if (isFalling) {
-      // Falling phase = guaranteed critical hit
       try {
         bot.attack(combatTarget);
         lastSelfDefenseAttack = now;
         critPending = false;
         addLog(`[Combat] ⚡ CRIT on ${combatTarget.name || combatTarget.type} (${dist.toFixed(1)}m)`);
-        // W-tap: briefly stop sprint so next sprint-attack resets knockback dir
         bot.setControlState("sprint", false);
         setTimeout(() => {
           try { bot.setControlState("sprint", true); } catch (e) {}
         }, 80);
       } catch (e) {}
     } else if (onGround && !critPending) {
-      // On ground + cooldown ready → jump to enter falling phase for crit
       critPending = true;
       try {
         bot.setControlState("jump", true);
@@ -1850,7 +1886,6 @@ function initializeModules(bot, mcData, defaultMove) {
         }, 80);
       } catch (e) {}
     }
-    // Rising phase: do nothing — wait until we start falling
   }, 50);
 
   addLog("[Modules] All modules initialized!");
