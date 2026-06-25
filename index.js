@@ -1054,7 +1054,6 @@ app.post("/command", express.json(), (req, res) => {
     return res.json({ success: true, msg });
   }
 
-  // Protect command
   if (cmd.startsWith("/protect")) {
     const arg = cmd.slice(8).trim();
     if (!arg || arg === "") {
@@ -1445,7 +1444,14 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    const password = config.utils["auto-auth"].password;
+    // FIX: read password from env var first, fall back to settings.json
+    const password =
+      process.env.AUTH_PASSWORD || config.utils["auto-auth"].password;
+
+    if (!password) {
+      addLog("[Auth] WARNING: No auth password set (AUTH_PASSWORD env var or settings.json)");
+    }
+
     let authHandled = false;
 
     const tryAuth = (type) => {
@@ -1592,7 +1598,7 @@ function initializeModules(bot, mcData, defaultMove) {
             !bot ||
             !botState.connected ||
             typeof bot.setControlState !== "function" ||
-            protectedPlayer  // don't micro-walk while protecting
+            protectedPlayer
           )
             return;
           try {
@@ -1695,7 +1701,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
     // Attack hostile mobs threatening the protected player
     const now = Date.now();
-    if (now - lastProtectAttack < 620) return; // respect 1.9+ attack cooldown
+    if (now - lastProtectAttack < 620) return;
 
     try {
       const threats = Object.values(bot.entities).filter((e) => {
@@ -1705,7 +1711,6 @@ function initializeModules(bot, mcData, defaultMove) {
 
       if (threats.length === 0) return;
 
-      // Pick the threat closest to the bot so we can reach it to swing
       const closestThreat = threats.reduce((best, e) =>
         bot.entity.position.distanceTo(e.position) <
         bot.entity.position.distanceTo(best.position)
@@ -1720,7 +1725,6 @@ function initializeModules(bot, mcData, defaultMove) {
         lastProtectAttack = now;
         addLog(`[Protect] Attacking threat near ${protectedPlayer}`);
       } else {
-        // Rush toward the threat first
         bot.pathfinder.setMovements(defaultMove);
         bot.pathfinder.setGoal(
           new GoalBlock(
@@ -1769,7 +1773,7 @@ function startCircleWalk(bot, defaultMove) {
   let lastPathTime = 0;
 
   addInterval(() => {
-    if (!bot || !botState.connected || protectedPlayer) return; // pause circle-walk while protecting
+    if (!bot || !botState.connected || protectedPlayer) return;
     const now = Date.now();
     if (now - lastPathTime < 2000) return;
     lastPathTime = now;
@@ -2009,7 +2013,6 @@ const rl = readline.createInterface({
 rl.on("line", (line) => {
   const trimmed = line.trim();
 
-  // Protect command — doesn't require bot to be connected to parse
   if (trimmed.startsWith("protect ")) {
     const target = trimmed.slice(8).trim();
     if (target === "stop" || target === "off") {
